@@ -21,6 +21,11 @@ export function messageSearchable(text: string) {
   return [...last].length >= MESSAGE_SEARCH_MIN_CHARS;
 }
 
+/** Whether a people search for `text` also matched verified names. The relay
+ * matches those under the message-search rule, so results for a shorter last
+ * word cover profiles alone and prove nothing about verified-only people. */
+export const verifiedNamesSearchable = messageSearchable;
+
 /** Runs `search` once typing pauses. Call the returned cleanup from the
  * effect that owns the search, alongside aborting its request. */
 export function searchDebounce(search: () => void, ms = SEARCH_DEBOUNCE_MS) {

@@ -63,8 +63,10 @@ export function usePeople(session: RelaySession, query: string) {
     // a reopened picker searches again for people added since.
     const exhausted = (entry?: PeopleState) =>
       entry?.hasMore === false && entry.visit === visit;
-    // Text too short to search shows only people already read.
-    const complete = exhausted(cache.get("")) || !searchable(query);
+    // Text too short to search shows only people already read. A finished
+    // browse is no substitute for a search: it lists profiles, and a person
+    // the relay verified may have none.
+    const complete = !searchable(query);
     const resumed = cached?.hasMore || exhausted(cached) ? cached : undefined;
     const known = new Map(
       [...cache.values()]

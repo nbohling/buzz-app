@@ -1,6 +1,6 @@
 import { expect, it, vi } from "vitest";
 import { nip19 } from "nostr-tools";
-import { createRelaySession } from "../relay/session";
+import { createRelaySession, type RelaySession } from "../relay/session";
 import { keypair, profile, signed } from "../relay/testing";
 import { eventDto, type ReadFilter } from "../relay/events";
 import { searchMembers, MEMBER_SEARCH_PAGE_SIZE } from "./search";
@@ -175,3 +175,35 @@ it("resolves the npub of a person with no profile by their relay-signed name", a
     owner.dispose();
   }
 });
+it.each([
+  ["withdrawn", () => undefined],
+  ["rotated", () => ({ pubkey: keypair().pubkey, multipleIssuers: false })],
+])(
+  "names no one by a head when the authority is %s during an npub lookup",
+  async (_change, next) => {
+    const relay = keypair(),
+      brittney = keypair();
+    let authority: { pubkey: string; multipleIssuers: boolean } | undefined = {
+      pubkey: relay.pubkey,
+      multipleIssuers: false,
+    };
+    let release = () => {};
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const session = {
+      profiles: { verifiedAuthority: () => authority },
+      async read() {
+        await held;
+        return [verifiedHead(relay, brittney.pubkey)];
+      },
+    } as unknown as RelaySession;
+    const pending = searchMembers(
+      session,
+      nip19.npubEncode(brittney.pubkey),
+      1,
+      new AbortController().signal,
+    );
+    authority = next();
+    release();
+    expect((await pending).people).toEqual([]);
+  },
+);

@@ -4,7 +4,11 @@ import type { ChannelSummary } from "../../features/relay/contracts";
 import { allowsOutsideMentions } from "../../features/messages/mention-admission";
 import { matchPerson } from "../../features/search/person-match";
 import { verifiedName } from "../../features/profiles/useVerifiedNames";
-import { searchDebounce, searchable } from "../../shared/search-debounce";
+import {
+  searchDebounce,
+  searchable,
+  verifiedNamesSearchable,
+} from "../../shared/search-debounce";
 
 type Person = Awaited<
   ReturnType<ComposerSession["directMessages"]["people"]>
@@ -45,7 +49,9 @@ function remember(session: ComposerSession, query: string, page: Page) {
  * it is a plain profile read, not a name search, and once complete (a
  * community with fewer than 15 profiles) it is a prefix of every query, so it
  * would answer each name search for the session and hide a member who joins
- * or renames after it.
+ * or renames after it. A key whose last word is too short for the relay to
+ * match verified names (`fa`) answered for profiles only, so it cannot stand
+ * in for `fake`, which also finds a person known only by a verified name.
  */
 function prefixPage(session: ComposerSession, query: string) {
   const queries = pages.get(session);
@@ -53,7 +59,7 @@ function prefixPage(session: ComposerSession, query: string) {
   let best: [string, Page] | undefined;
   for (const [key, page] of queries)
     if (
-      key.trim().length > 0 &&
+      verifiedNamesSearchable(key) &&
       !page.more &&
       key.length < query.length &&
       query.startsWith(key) &&
@@ -125,8 +131,14 @@ export async function fetchMentionDirectoryPage(
   const page = { people, more: hasMore };
   if (signal.aborted) return page;
   if (people.length) remember(session, query, page);
-  // The relay ignores non-word text, so it only refutes word prefixes.
-  else if (!hasMore && !exactKey(query) && /[\p{L}\p{N}]/u.test(query))
+  // The relay ignores non-word text, so it only refutes word prefixes, and
+  // matches verified names only from a long enough last word.
+  else if (
+    !hasMore &&
+    !exactKey(query) &&
+    /[\p{L}\p{N}]/u.test(query) &&
+    verifiedNamesSearchable(query)
+  )
     exhausted.set(session, query);
   return page;
 }
