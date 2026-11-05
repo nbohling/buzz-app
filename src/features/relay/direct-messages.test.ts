@@ -613,6 +613,93 @@ describe("verified names for a search page", () => {
     }
   });
 
+  it("names a profiled person found by a verified name with it", async () => {
+    const viewer = keypair(),
+      relay = keypair(),
+      jack = keypair();
+    const owner = createRelaySession({
+      viewer: viewer.pubkey,
+      relayAuthor: relay.pubkey,
+      media: () => undefined,
+      query: async () => [],
+      searchProfiles: async () =>
+        [
+          profile(jack, { name: "jack" }),
+          assertion(relay, jack.pubkey, {
+            display: "aleksandr",
+            full: "Aleksandr Petrov",
+          }),
+        ].map((event) => eventDto(event)),
+      verifiedProfiles: {
+        pubkey: relay.pubkey,
+        multipleIssuers: false,
+        searchable: true,
+      },
+    });
+    try {
+      const { people } = await owner.session.directMessages.people(
+        "petrov",
+        1,
+        new AbortController().signal,
+      );
+      expect(people).toEqual([
+        expect.objectContaining({
+          pubkey: jack.pubkey,
+          name: "jack",
+          verified: expect.objectContaining({ fullName: "Aleksandr Petrov" }),
+        }),
+      ]);
+    } finally {
+      owner.dispose();
+    }
+  });
+
+  it.each([
+    ["withdrawn", () => undefined],
+    ["rotated", () => ({ pubkey: keypair().pubkey, multipleIssuers: false })],
+  ] as [string, () => VerifiedProfileAuthority | undefined][])(
+    "names no one by a head when the authority is %s during a key lookup",
+    async (_change, next) => {
+      const relay = keypair(),
+        brittney = keypair();
+      let authority: VerifiedProfileAuthority | undefined = {
+        pubkey: relay.pubkey,
+        multipleIssuers: false,
+      };
+      let release = () => {};
+      const held = new Promise<void>((resolve) => (release = resolve));
+      const directoryReader = {
+        async read() {
+          await held;
+          return [
+            eventDto(
+              assertion(relay, brittney.pubkey, { display: "brittneyg" }),
+            ),
+          ];
+        },
+      } as unknown as RelayReader;
+      const directMessages = createDirectMessages(
+        null,
+        directoryReader,
+        undefined as never,
+        undefined,
+        undefined,
+        new AbortController().signal,
+        directoryReader,
+        { verifiedHeads: () => new Map() } as never,
+        () => authority,
+      );
+      const pending = directMessages.people(
+        brittney.pubkey,
+        1,
+        new AbortController().signal,
+      );
+      authority = next();
+      release();
+      expect((await pending).people).toEqual([]);
+    },
+  );
+
   const changes: [string, () => VerifiedProfileAuthority | undefined][] = [
     ["withdrawn", () => undefined],
     ["rotated", () => ({ pubkey: keypair().pubkey, multipleIssuers: false })],

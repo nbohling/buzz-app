@@ -43,7 +43,15 @@ export async function searchMembers(
         signal,
       });
   signal.throwIfAborted();
-  const profiles = searchedProfiles(events, authority);
+  // Names belong to the authority that checked them: one replaced during the
+  // read names no one.
+  const profiles = searchedProfiles(
+    events,
+    session.profiles.verifiedAuthority?.() === authority
+      ? authority
+      : undefined,
+  );
+  const found = profiles.size;
   if (exact)
     for (const pubkey of profiles.keys())
       if (pubkey !== exact) profiles.delete(pubkey);
@@ -58,7 +66,7 @@ export async function searchMembers(
           a.name.localeCompare(b.name) ||
           a.pubkey.localeCompare(b.pubkey),
       ),
-    more: !exact && events.length >= MEMBER_SEARCH_PAGE_SIZE,
+    more: !exact && found >= MEMBER_SEARCH_PAGE_SIZE,
   };
 }
 export type MemberSearchResult = Awaited<ReturnType<typeof searchMembers>>;

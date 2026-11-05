@@ -1887,6 +1887,21 @@ it("finds a person with no profile by any verified name the directory found them
   }
 });
 
+it("finds a person with a profile by the verified name the directory found them by", async () => {
+  const t = setup();
+  // The saved profile is "jack"; the directory matched the verified name.
+  const found = { ...aleksandr, verified: petrov };
+  t.directMessages.people.mockImplementation(async (query, page) => ({
+    people: query.trim() ? [found] : [],
+    hasMore: !query.trim() && page === 1,
+  }));
+  verifying(t, new Map([[aleksandr.pubkey, petrov]]));
+  t.mount();
+  await waitFor(() => expect(recipient()).toBeEnabled());
+  await t.user.type(recipient(), "petrov");
+  expect(await screen.findByRole("option", petrovRow)).toBeVisible();
+});
+
 it("relabels a recipient whose verification answers late, keeping a failed send's error", async () => {
   const t = setup();
   t.directMessages.people.mockResolvedValue({

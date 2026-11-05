@@ -81,8 +81,14 @@ export function createDirectMessages(
               { signal: active, priority },
             );
       active.throwIfAborted();
+      // Names belong to the authority that checked them: one replaced
+      // during the read names no one.
+      const found = searchedProfiles(
+        events,
+        verifiedAuthority() === authority ? authority : undefined,
+      );
       return {
-        people: [...searchedProfiles(events, authority)]
+        people: [...found]
           .filter(
             ([pubkey]) =>
               pubkey !== transport?.viewer && (!exactKey || pubkey === value),
@@ -101,7 +107,7 @@ export function createDirectMessages(
               ...(verified ? { verified } : {}),
             }),
           ),
-        hasMore: events.length >= limit,
+        hasMore: found.size >= limit,
       };
     },
     /** One bounded read of the community's verified names for a search page,

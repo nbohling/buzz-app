@@ -7,6 +7,7 @@ import type { RelayReader } from "./reader";
 import {
   verifiedProfile,
   verifiedProfileSubject,
+  type VerifiedProfile,
   type VerifiedProfileAuthority,
 } from "./verified-profile";
 
@@ -49,8 +50,9 @@ export const PROFILE_SEARCH_HEADS_MS = 30_000;
  *
  * Where the community has a verified-profile authority, the endpoint also
  * finds people by their verified names and returns each found person's
- * current verified head. A person with no kind:0 is returned as that head, so
- * a page holds one event per person; {@link searchedProfiles} names them.
+ * current verified head. Results keep each person's kind:0 and their newest
+ * head signed by the authority; {@link searchedProfiles} folds them, one
+ * entry per person, and names a person with no kind:0 by their head.
  * Where the authority is `searchable`, a missing head means there is none, and
  * the answers are kept, a page at a time, for {@link verifiedHeads}. */
 export function createProfileSearch(
@@ -162,47 +164,54 @@ export function createProfileSearch(
 }
 export type ProfileSearch = ReturnType<typeof createProfileSearch>;
 
-/** One event per person: their kind:0, or else their newest head signed by
- * `authority`. Heads from any other key are dropped. */
+/** Each person's kind:0, and their newest head signed by `authority`. Heads
+ * from any other key are dropped. */
 function people<T extends EventData>(
   events: readonly T[],
   authority: VerifiedProfileAuthority | undefined,
 ): readonly T[] {
-  const profiled = new Set(
-    events.filter((event) => event.kind === 0).map((event) => event.pubkey),
-  );
   const heads = new Map<string, T>();
   if (authority)
     for (const event of events) {
       const subject = verifiedProfileSubject(event, authority);
-      if (subject && !profiled.has(subject))
-        heads.set(subject, newer(heads.get(subject), event));
+      if (subject) heads.set(subject, newer(heads.get(subject), event));
     }
   const chosen = new Set(heads.values());
   return events.filter((event) => event.kind === 0 || chosen.has(event));
 }
 
-/** The people a profile search or key lookup found, in its order. A person
- * with no kind:0 is named by their newest head, when it is signed by
- * `authority` and valid; any other head is ignored. Their verified username
- * stands in for a handle, so pickers match it as the relay did. */
+/** The people a profile search or key lookup found, in its order, with the
+ * verified name of each whose newest head is signed by `authority` and valid;
+ * any other head is ignored. A person with no kind:0 is named by it, with
+ * their verified username as a handle, so pickers match them as the relay
+ * did. */
 export function searchedProfiles(
   events: readonly EventData[],
   authority: VerifiedProfileAuthority | undefined,
 ): Map<string, Profile> {
   const folded = foldProfiles(events);
-  const profiles = new Map<string, Profile>();
+  const found = new Map<string, VerifiedProfile | undefined>();
   for (const event of people(events, authority)) {
     if (event.kind === 0) {
-      const profile = folded.get(event.pubkey);
-      if (profile) profiles.set(event.pubkey, profile);
+      if (!found.has(event.pubkey)) found.set(event.pubkey, undefined);
       continue;
     }
     const subject = authority && verifiedProfileSubject(event, authority);
-    const verified = authority && verifiedProfile(event, authority, true);
-    if (subject && verified)
+    const verified = subject && verifiedProfile(event, authority, true);
+    // A newer malformed head withdraws the name; a profile still counts.
+    if (subject && verified) found.set(subject, verified);
+  }
+  const profiles = new Map<string, Profile>();
+  for (const [pubkey, verified] of found) {
+    const profile = folded.get(pubkey);
+    if (profile)
       profiles.set(
-        subject,
+        pubkey,
+        verified ? Object.freeze({ ...profile, verified }) : profile,
+      );
+    else if (verified)
+      profiles.set(
+        pubkey,
         Object.freeze({
           name: verified.displayName,
           ...(verified.username !== verified.displayName

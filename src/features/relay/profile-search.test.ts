@@ -247,9 +247,10 @@ describe("verified heads from a searchable relay", () => {
 
   it("keeps each found person\x27s newest relay head, or none, once", async () => {
     const t = headsSetup(searchable);
+    // Each person's profile and newest relay head; others are dropped.
     expect(
       await t.searchProfiles("fak", { limit: 30, signal: signal() }),
-    ).toEqual([fakeProfile, plainProfile]);
+    ).toEqual([fakeProfile, newest, plainProfile]);
     const pubkeys = [fake.pubkey, plain.pubkey, keypair().pubkey];
     expect(t.searchProfiles.verifiedHeads(pubkeys, searchable)).toEqual(
       new Map([
@@ -338,7 +339,7 @@ describe("people found only by a verified name", () => {
     );
   }
 
-  it("returns one event per person: a profile, or else the newest relay head", async () => {
+  it("returns each person\x27s profile and newest relay head", async () => {
     expect(
       await search(authority)("brit", { limit: 30, signal: signal() }),
     ).toEqual([current, plainProfile]);
@@ -368,7 +369,7 @@ describe("people found only by a verified name", () => {
     ).toBe(0);
   });
 
-  it("keeps a person\x27s own profile over their head", () => {
+  it("keeps a person\x27s own profile, with the verified name it was found by", () => {
     const own = signed(unprofiled, {
       kind: 0,
       content: JSON.stringify({ name: "Brit" }),
@@ -376,6 +377,31 @@ describe("people found only by a verified name", () => {
     });
     expect(
       searchedProfiles([current, own], authority).get(unprofiled.pubkey),
-    ).toMatchObject({ name: "Brit" });
+    ).toMatchObject({ name: "Brit", verified: { displayName: "Brittney G" } });
+  });
+
+  it("drops a verified name a newer malformed head withdrew", () => {
+    const withdrawn = eventDto(
+      signed(relay, {
+        kind: 30382,
+        created_at: 3_000,
+        content: "",
+        tags: [
+          ["d", unprofiled.pubkey],
+          ["p", unprofiled.pubkey],
+        ],
+      }),
+    );
+    expect(searchedProfiles([current, withdrawn], authority).size).toBe(0);
+    const own = signed(unprofiled, {
+      kind: 0,
+      content: JSON.stringify({ name: "Brit" }),
+      tags: [],
+    });
+    const found = searchedProfiles([current, own, withdrawn], authority);
+    expect(found.get(unprofiled.pubkey)).toEqual(
+      expect.not.objectContaining({ verified: expect.anything() }),
+    );
+    expect(found.get(unprofiled.pubkey)?.name).toBe("Brit");
   });
 });

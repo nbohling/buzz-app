@@ -8,6 +8,7 @@ import { objectBody } from "../../features/relay/body";
 import type { RelaySession } from "../../features/relay/session";
 import type { ReadFilter } from "../../features/relay/events";
 import { foldProfiles } from "../../features/relay/profiles";
+import { searchedProfiles } from "../../features/relay/profile-search";
 import { normalizeName } from "../../features/search/person-match";
 import {
   isHexPubkey,
@@ -282,7 +283,13 @@ export function useSearchMessages(
                 )
                 .map(([pubkey]) => pubkey);
               const found = resolve([...matches, ...agentMatches]);
-              if (found.ambiguous || candidates.length >= limit)
+              // The relay pages people, each with a profile and verified
+              // name, so a full page counts people, not events.
+              const people = searchedProfiles(
+                candidates,
+                session.profiles.verifiedAuthority?.(),
+              ).size;
+              if (found.ambiguous || people >= limit)
                 return { messages: [], ambiguousAuthor: true };
               author = found.author;
             }
