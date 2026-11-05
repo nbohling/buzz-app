@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { browserReadPublisherLock, createReadState } from "./read-state";
+import { overrideActive } from "./read-state-model";
 import {
   newReadJournal,
   readJournal,
@@ -100,6 +101,10 @@ function fixture(now = 100) {
           ]),
       );
     },
+    addRemote: (event: RelayEvent) => {
+      remote = [...remote, event];
+    },
+    remoteEvents: () => remote,
     setNow: (value: number) => {
       now = value;
     },
@@ -108,6 +113,29 @@ function fixture(now = 100) {
       journal = value;
     },
   };
+}
+function peerUnreadMarker(
+  f: ReturnType<typeof fixture>,
+  key: string,
+  baseline = 0,
+) {
+  return signReadState(
+    {
+      slot: "b".repeat(32),
+      createdAt: 100,
+      blob: {
+        v: 1,
+        client_id: "peer",
+        contexts: {
+          [`ov_s:${key}`]: 1,
+          [`ov_c:${key}`]: 0,
+          [`ov_b:${key}`]: baseline,
+        },
+      },
+    },
+    f.key.secret,
+    100,
+  );
 }
 describe("durable read-state owner", () => {
   it("saves intent and exact signed event before publishing, then confirms the coordinate", async () => {
@@ -504,6 +532,186 @@ describe("durable read-state owner", () => {
     await Promise.all([a.ready, b.ready]);
     await Promise.all([a.read("a", 2, () => true), b.read("b", 3, () => true)]);
     expect(f.journal()?.state.frontiers).toEqual({ a: 2, b: 3 });
+  });
+  it.each([
+    { outcome: "successful", failRead: false },
+    { outcome: "failed", failRead: true },
+  ])(
+    "does not lift a stale peer unread baseline over the pre-read frontier when the automatic read is $outcome",
+    async ({ failRead }) => {
+      const f = fixture();
+      const id = "a".repeat(64);
+      const key = `msg:${id}`;
+      f.setJournal({
+        ...newReadJournal(),
+        state: { frontiers: { [key]: 9 }, overrides: {} },
+      });
+      const owner = f.make();
+      await owner.ready;
+      let release = () => {};
+      let started = () => {};
+      const hold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const saving = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const update = vi.mocked(f.storage.update).getMockImplementation();
+      if (!update) throw new Error("Missing fixture storage");
+      vi.mocked(f.storage.update).mockImplementationOnce(async (change) => {
+        started();
+        await hold;
+        if (failRead) throw new Error("disk full");
+        return update(change);
+      });
+      const marker = peerUnreadMarker(f, key, 5);
+      const automaticRead = owner.read(key, 11, () => true);
+      try {
+        await saving;
+        owner.accept([marker]);
+        release();
+        if (failRead) await expect(automaticRead).rejects.toThrow("disk full");
+        else await automaticRead;
+      } finally {
+        release();
+      }
+      await expect
+        .poll(() => f.journal()?.state.overrides[key]?.baseline)
+        .toBe(5);
+      expect(
+        overrideActive(
+          owner.state().overrides[key],
+          owner.state().frontiers[key],
+        ),
+      ).toBe(false);
+      expect(owner.state().frontiers[key]).toBe(failRead ? 9 : 11);
+    },
+  );
+  it("does not lift peer unread for an automatic read started after marker acceptance", async () => {
+    const f = fixture();
+    const owner = f.make();
+    await owner.ready;
+    let release = () => {};
+    let started = () => {};
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const saving = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const update = vi.mocked(f.storage.update).getMockImplementation();
+    if (!update) throw new Error("Missing fixture storage");
+    vi.mocked(f.storage.update).mockImplementationOnce(async (change) => {
+      started();
+      await hold;
+      return update(change);
+    });
+    const busy = owner.read("other", 1, () => true);
+    const id = "c".repeat(64);
+    const key = `msg:${id}`;
+    const marker = peerUnreadMarker(f, key);
+    try {
+      await saving;
+      owner.accept([marker]);
+      const automaticRead = owner.read(key, 11, () => true);
+      release();
+      await busy;
+      await automaticRead;
+    } finally {
+      release();
+    }
+    await expect
+      .poll(() => f.journal()?.state.overrides[key]?.baseline)
+      .toBe(0);
+    expect(
+      overrideActive(
+        owner.state().overrides[key],
+        owner.state().frontiers[key],
+      ),
+    ).toBe(false);
+    expect(owner.state().frontiers[key]).toBe(11);
+  });
+  it("keeps a peer unread ordered after an in-flight automatic read across windows and restart", async () => {
+    const f = fixture();
+    const options = { broadcastName: `read-unread:${crypto.randomUUID()}` };
+    const a = f.make(options),
+      b = f.make(options);
+    await Promise.all([a.ready, b.ready]);
+    const id = "a".repeat(64);
+    const key = `msg:${id}`;
+    let release = () => {};
+    let started = () => {};
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const saving = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const update = vi.mocked(f.storage.update).getMockImplementation();
+    if (!update) throw new Error("Missing fixture storage");
+    vi.mocked(f.storage.update).mockImplementationOnce(async (change) => {
+      started();
+      await hold;
+      return update(change);
+    });
+    const marker = peerUnreadMarker(f, key);
+    f.addRemote(marker);
+    const automaticRead = a.read(key, 11, () => true);
+    try {
+      await saving;
+      a.accept([marker]);
+      release();
+      await automaticRead;
+    } finally {
+      release();
+    }
+    await expect
+      .poll(() =>
+        overrideActive(b.state().overrides[key], b.state().frontiers[key]),
+      )
+      .toBe(true);
+    expect(f.journal()?.state.overrides[key]).toEqual({
+      set: 1,
+      clear: 0,
+      baseline: 11,
+    });
+    expect(
+      decodeReadState([marker], f.key.secret)[0]?.blob.contexts[`ov_b:${key}`],
+    ).toBe(0);
+    a.accept([marker]);
+    await expect
+      .poll(() => f.journal()?.state.overrides[key]?.baseline)
+      .toBe(11);
+
+    const saved = f.journal();
+    if (!saved) throw new Error("Missing saved read state");
+    a.dispose();
+    b.dispose();
+    f.setJournal(readJournal(JSON.parse(JSON.stringify(saved)), f.key.pubkey));
+    const restarted = f.make();
+    await restarted.ready;
+    restarted.accept([marker]);
+    await expect
+      .poll(() => f.journal()?.state.overrides[key]?.baseline)
+      .toBe(11);
+    expect(
+      overrideActive(
+        restarted.state().overrides[key],
+        restarted.state().frontiers[key],
+      ),
+    ).toBe(true);
+    expect(restarted.state().frontiers[key]).toBe(11);
+    await restarted.flush();
+    expect(f.own()).toEqual({});
+    expect(f.remoteEvents()).toContainEqual(marker);
+    const explicitRead = true;
+    await restarted.read(key, 12, () => true, explicitRead);
+    expect(
+      overrideActive(
+        restarted.state().overrides[key],
+        restarted.state().frontiers[key],
+      ),
+    ).toBe(false);
   });
   it("a surviving window publishes broadcast intent and reports pending until readback", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });

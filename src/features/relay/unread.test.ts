@@ -2325,6 +2325,67 @@ it("bottom catch-up ends a manual channel unread but keeps marked messages", asy
   again.dispose();
 });
 
+it("keeps peer message-unread intent effective across an in-flight automatic read", async () => {
+  const h = setup();
+  h.grant("room");
+  const row = message(h.alice, "room", "hello", 11, [["p", h.viewer.pubkey]]);
+  h.emit([row]);
+  await flush();
+  const unread = h.session.unread;
+  const target = {
+    kind: "message" as const,
+    channelId: "room",
+    messageId: row.id,
+  };
+  const reading = unread.reading("room");
+  const readSave = h.holdSaveStarted();
+  const automaticRead = reading.observe([row.id]);
+  let peerSave: ReturnType<typeof h.holdSaveStarted> | undefined;
+  try {
+    await readSave.started;
+    peerSave = h.holdSaveStarted();
+    const createdAt = Math.floor(Date.now() / 1000);
+    const marker = await signReadState(
+      {
+        slot: "a".repeat(32),
+        createdAt,
+        blob: {
+          v: 1,
+          client_id: "peer",
+          contexts: {
+            [`ov_s:msg:${row.id}`]: 1,
+            [`ov_c:msg:${row.id}`]: 0,
+            [`ov_b:msg:${row.id}`]: 0,
+          },
+        },
+      },
+      h.viewer.secret,
+      createdAt,
+    );
+    h.emit([marker]);
+    readSave.release();
+    await automaticRead;
+    await peerSave.started;
+  } finally {
+    readSave.release();
+    peerSave?.release();
+  }
+  await expect.poll(() => unread.snapshot(target).manual).toBe("remote");
+  expect(h.journal()?.state.overrides[`msg:${row.id}`]).toEqual({
+    set: 1,
+    clear: 0,
+    baseline: 11,
+  });
+  expect(unread.attention("room", row.id).unread).toBe(true);
+  reading.dispose();
+
+  clock(20);
+  await unread.markChannelRead("room");
+  await expect.poll(() => unread.snapshot(target).manual).toBe("none");
+  expect(unread.attention("room", row.id).unread).toBe(false);
+  expect(h.journal()?.state.frontiers.room).toBe(20);
+});
+
 it("thread bottom catch-up clears only its thread and preserves local and remote manual intent", async () => {
   const h = setup();
   h.grant("room");

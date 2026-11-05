@@ -163,6 +163,12 @@ export function createReadState({
   let attemptedRevision = -1;
   let failedRevision: number | undefined;
   let work: Promise<unknown> = Promise.resolve();
+  type AutomaticReadAttempt = {
+    status: "pending" | "saved" | "failed";
+    before?: number;
+    after?: number;
+  };
+  const pendingAutomaticReads = new Map<string, Set<AutomaticReadAttempt>>();
   let epoch = 0;
   let requested = false;
   /** The completeness the last drop interrupted, while nothing since has
@@ -381,6 +387,10 @@ export function createReadState({
     events: readonly RelayEvent[],
     signal: AbortSignal,
     generation = epoch,
+    concurrentAutomaticReads: ReadonlyMap<
+      string,
+      ReadonlySet<AutomaticReadAttempt>
+    > = new Map(),
   ) {
     const decoded = await decode(events, signal);
     if (closed || generation !== epoch)
@@ -404,11 +414,45 @@ export function createReadState({
           owned.includes(readCoordinate(event) ?? "")
         )
           own = advanceOwn(own, parsed.state.frontiers);
+      const incoming = decoded.map(({ parsed }) => {
+        if (parsed.clientId === current.clientId) return parsed.state;
+        const overrides = { ...parsed.state.overrides };
+        let changed = false;
+        // A peer unread accepted during an automatic read wins locally without
+        // changing the signed event or overtaking a newer local frontier.
+        for (const [key, override] of Object.entries(overrides)) {
+          const existing = current.state.overrides[key];
+          if (
+            override.set <=
+            Math.max(override.clear, existing?.set ?? 0, existing?.clear ?? 0)
+          )
+            continue;
+          const afterRead = [
+            ...(concurrentAutomaticReads.get(key) ?? []),
+          ].reduce((after, read) => {
+            const { before, after: readAfter } = read;
+            return read.status === "saved" &&
+              before !== undefined &&
+              readAfter !== undefined &&
+              readAfter > before &&
+              override.baseline >= before
+              ? Math.max(after, readAfter)
+              : after;
+          }, override.baseline);
+          if (afterRead > override.baseline) {
+            overrides[key] = { ...override, baseline: afterRead };
+            changed = true;
+          }
+        }
+        return changed
+          ? { ...parsed.state, overrides: Object.freeze(overrides) }
+          : parsed.state;
+      });
       return {
         ...current,
         ...retainMarks(
           current,
-          [current.state, ...decoded.map(({ parsed }) => parsed.state)],
+          [current.state, ...incoming],
           current.recent ?? {},
         ),
         ...(own && { own }),
@@ -528,7 +572,17 @@ export function createReadState({
     valid: Validity,
     clearLocalKeys: readonly string[] = [key],
   ): Promise<ReadMutationResult> {
-    return queue(async () => {
+    const automatic =
+      key.startsWith("msg:") && timestamp !== undefined && unread === undefined;
+    const automaticRead: AutomaticReadAttempt | undefined = automatic
+      ? { status: "pending" }
+      : undefined;
+    if (automaticRead) {
+      const reads = pendingAutomaticReads.get(key) ?? new Set();
+      reads.add(automaticRead);
+      pendingAutomaticReads.set(key, reads);
+    }
+    const result = queue<ReadMutationResult>(async () => {
       await ready;
       if (!journal)
         throw new Error("Saved read state unavailable; retry storage first");
@@ -547,6 +601,10 @@ export function createReadState({
             timestamp === undefined
               ? (current.recent ?? {})
               : { ...current.recent, [key]: revision };
+          const before =
+            automaticRead === undefined
+              ? undefined
+              : (localState(current).frontiers[key] ?? 0);
           const kept =
             timestamp === undefined
               ? {
@@ -568,6 +626,20 @@ export function createReadState({
           if (unread === false)
             for (const clearKey of clearLocalKeys) delete localUnread[clearKey];
           if (unread === true) localUnread[key] = revision;
+          const own = advanceOwn(
+            current.own,
+            timestamp === undefined ? {} : { [key]: timestamp },
+          );
+          if (automaticRead && before !== undefined) {
+            automaticRead.before = before;
+            automaticRead.after =
+              localState({
+                ...current,
+                state: kept.state,
+                reserve: kept.reserve,
+                own,
+              }).frontiers[key] ?? before;
+          }
           return {
             ...current,
             revision,
@@ -575,10 +647,7 @@ export function createReadState({
             recent: kept.recent,
             reserve: kept.reserve,
             homes: kept.homes,
-            own: advanceOwn(
-              current.own,
-              timestamp === undefined ? {} : { [key]: timestamp },
-            ),
+            own,
             localUnread,
             acceptedRevision:
               timestamp === undefined &&
@@ -587,6 +656,7 @@ export function createReadState({
                 : current.acceptedRevision,
           };
         });
+        if (automaticRead) automaticRead.status = "saved";
         health({
           status: capability === "frontier-sync" ? "pending" : "local",
           error: undefined,
@@ -601,10 +671,17 @@ export function createReadState({
               : "local-only",
         };
       } catch (error) {
+        if (automaticRead) automaticRead.status = "failed";
         if (!(error instanceof ObservationExpired))
           health({ status: "error", error: errorText(error) });
         throw error;
       }
+    });
+    if (!automatic) return result;
+    return result.finally(() => {
+      const reads = pendingAutomaticReads.get(key);
+      reads?.delete(automaticRead as AutomaticReadAttempt);
+      if (!reads?.size) pendingAutomaticReads.delete(key);
     });
   }
   async function flush() {
@@ -1041,9 +1118,12 @@ export function createReadState({
         lifetime.signal,
         AbortSignal.timeout(10000),
       ]);
+      const concurrentAutomaticReads = new Map(
+        [...pendingAutomaticReads].map(([key, reads]) => [key, new Set(reads)]),
+      );
       void queue(async () => {
         try {
-          await ingest(events, signal, generation);
+          await ingest(events, signal, generation, concurrentAutomaticReads);
         } catch (error) {
           if (!closed && generation === epoch) {
             observationOwed = true;
